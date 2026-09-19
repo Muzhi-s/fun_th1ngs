@@ -38,16 +38,38 @@ def _normalize_answer(
     product = _text_or(metadata.get("product_name"), "未知产品")
     description = _text_or(metadata.get("file_description"), "暂无可用描述")
     version = _text_or(metadata.get("version"), "版本未知")
-    risk_level = _text_or(risk.get("risk_level"), "unknown")
+
+    # 风险等级英文→中文映射
+    risk_en = str(risk.get("risk_level", "unknown")).casefold()
+    risk_level_cn = _risk_level_to_chinese(risk_en)
     rule_reason = _text_or(risk.get("reason"), "未命中明确规则")
 
-    summary = _text_or(parsed.get("summary"), "")
-    if not summary:
-        summary = _fallback_summary(file_name, company, risk_level)
+    # 翻译成中文
+    summary = _translate_to_chinese(_text_or(parsed.get("summary"), ""))
+    purpose = _translate_to_chinese(_text_or(parsed.get("purpose"), ""))
+    risk_field = _translate_to_chinese(_text_or(parsed.get("risk"), ""))
+    advice = _translate_to_chinese(_text_or(parsed.get("advice"), ""))
+    confidence = _text_or(parsed.get("confidence"), "")
+
+    # 如果模型给出的是显式不确定，则回退到更稳定的本地信息
+    if _is_uncertain_text(summary):
+        summary = _fallback_summary(file_name, company, risk_level_cn)
+    if not purpose or _is_uncertain_text(purpose):
+        purpose = _fallback_purpose(description)
+    if _is_uncertain_text(advice):
+        advice = _fallback_advice(risk_level_cn, rule_reason)
+    if _is_uncertain_text(risk_field):
+      risk_field = risk_level_cn
+    if _is_uncertain_text(confidence):
+      confidence = "中等(模型判断结果可能不够准确，请谨慎处理)"
+    if not confidence:
+      confidence = "中等(模型判断结果可能不够准确，请谨慎处理)"
+
+
     # 从各数据源中提取信息，构建标准化的回答字典
     return {
-        "status": _status_text(parsed.get("advice"), risk_level),
-        "status_class": _status_class(parsed.get("advice"), risk_level),
+        "status": _status_text(advice, risk_level_cn),
+        "status_class": _status_class(advice, risk_level_cn),
         "summary": summary,
         "file_name": file_name,
         "mini_path": _compact_path(full_path),
@@ -56,12 +78,47 @@ def _normalize_answer(
         "product": product,
         "description": description,
         "version": version,
-        "purpose": _text_or(parsed.get("purpose"), description),
-        "advice": _text_or(parsed.get("advice"), _fallback_advice(risk_level, rule_reason)),
-        "risk": _text_or(parsed.get("risk"), rule_reason),
-        "confidence": _text_or(parsed.get("confidence"), "中等：基于文件元数据和本地规则判断"),
-        "confidence_class": _confidence_class(parsed.get("confidence")),
+        "purpose": purpose,
+        "advice": advice,
+        "risk": risk_field,
+        "confidence": confidence,
+        "confidence_class": _confidence_class(confidence),
     }
+
+def _risk_level_to_chinese(risk_en: str) -> str:
+    """将英文风险等级转为中文"""
+    mapping = {
+        "high": "高风险",
+        "medium": "中风险",
+        "low": "低风险",
+        "unknown": "未知风险",
+        "danger": "高风险",
+        "safe": "低风险",
+    }
+    return mapping.get(risk_en.casefold(),risk_en)
+
+def _translate_to_chinese(text: str) -> str:
+    """将常见的英文AI回答片段翻译为中文"""
+    if not text:
+        return ""
+    #常见文件类型描述翻译
+    translations = {
+        "summary": "概要",
+        "purpose": "用途",
+        "risk": "风险",
+        "advice": "建议",
+        "confidence": "置信度",
+        "unknown": "未知",
+        "high risk": "高风险",
+        "medium risk": "中风险",
+        "low risk": "低风险",
+        "delete advice": "删除建议",
+        "keep advice": "保留建议",
+    }
+    for eng, chi in translations.items():
+        text = re.sub(rf"\b{re.escape(eng)}\b", chi, text, flags=re.IGNORECASE)
+    return text
+
 
 # HTML卡片
 def _build_card_html(answer: dict[str, str]) -> str:
@@ -433,11 +490,11 @@ def _parse_labeled_text(text: str) -> dict[str, str] | None:
         return None
 
     label_map = {
-        "summary": ("summary", "概要", "总结", "结论"),
-        "purpose": ("purpose", "用途", "文件用途", "作用"),
+        "summary": ("summary", "概要", "总结", "结论","文件简介"),
+        "purpose": ("purpose", "用途", "文件用途", "作用","主要作用"),
         "risk": ("risk", "风险", "风险判断", "安全性"),
-        "advice": ("advice", "删除建议", "建议", "deletion advice"),
-        "confidence": ("confidence", "置信度", "可信度"),
+        "advice": ("advice", "删除建议", "建议", "deletion advice","处理建议"),
+        "confidence": ("confidence", "置信度", "可信度","自信度"),
     }
     labels = [label for values in label_map.values() for label in values]
     label_pattern = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
@@ -516,44 +573,61 @@ def _text_or(value: object, fallback: str) -> str:
     return text if text else fallback
 
 
+def _is_uncertain_text(text: object) -> bool:
+  normalized = str(text or "").strip().casefold()
+  return normalized in {"不确定", "unknown", "uncertain", "n/a", "na", "null", "none"}
+
+
 def _fallback_summary(file_name: str, company: str, risk_level: str) -> str:
     return f"{file_name} 来自 {company}，当前风险判断为 {risk_level}"
 
 
 def _fallback_advice(risk_level: str, rule_reason: str) -> str:
     normalized = risk_level.casefold()
-    if "high" in normalized or "danger" in normalized:
+    if "高风险" in normalized or "danger" in normalized:
         return f"暂不建议直接删除。{rule_reason}"
-    if "low" in normalized or "safe" in normalized:
+    if "低风险" in normalized or "safe" in normalized:
         return f"通常可以删除，但请先确认它不是你正在使用的软件组件。{rule_reason}"
     return f"建议先保留，确认来源和用途后再处理。{rule_reason}"
 
 
+def _fallback_purpose(description: str) -> str:
+  text = str(description or "").strip()
+  if not text:
+    return "不确定"
+
+  normalized = text.casefold()
+  if normalized in {"unknown", "uncertain", "n/a", "na", "null", "none"}:
+    return "不确定"
+
+  return text
+
+
 def _status_text(advice: object, risk_level: str) -> str:
-    combined = f"{advice or ''} {risk_level}".casefold()
-    if "删除" in combined or "delete" in combined:
+    combined = f"{advice or ''} {risk_level}"
+    if "删除" in combined or "delete" in combined.casefold():
         return "可以考虑清理"
-    if "保留" in combined or "keep" in combined:
+    if "保留" in combined or "keep" in combined.casefold():
         return "建议先保留"
-    if "high" in combined or "danger" in combined:
+    if "high" in combined or "danger" in combined.casefold():
         return "谨慎处理"
     return "需要确认"
 
 
 def _status_class(advice: object, risk_level: str) -> str:
-    combined = f"{advice or ''} {risk_level}".casefold()
-    if "删除" in combined or "delete" in combined or "low" in combined or "safe" in combined:
+    combined = f"{advice or ''} {risk_level}"
+    if "删除" in combined or "delete" in combined.casefold() or "低风险" in combined or "safe" in combined.casefold():
         return "status-safe"
-    if "high" in combined or "danger" in combined or "谨慎" in combined:
+    if "高风险" in combined or "danger" in combined.casefold() or "谨慎" in combined:
         return "status-risk"
     return "status-unknown"
 
 
 def _confidence_class(confidence: object) -> str:
     text = str(confidence or "").strip()
-    if any(token in text for token in ("高", "high", "90", "95")):
+    if any(token in text for token in ("高", "high", "90", "95","98")):
         return "confidence-high"
-    if any(token in text for token in ("低", "low", "50", "60")):
+    if any(token in text for token in ("低", "low", "50", "60","30")):
         return "confidence-low"
     return "confidence-medium"
 
